@@ -1,0 +1,9 @@
+{
+  "name": "ByteWitness",
+  "short_name": "ByteWitness",
+  "description": "Private, portable cryptographic file integrity receipts.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8f7f2",
+  "theme_color": "#a8f400"
+}
