@@ -43,7 +43,7 @@ React, TypeScript, Vite, Web Crypto, ECDSA P-256, SHA-256, IndexedDB, Zod, Noble
 ## Required submission assets
 
 - Public GitHub repository: https://github.com/Anand-0038/bytewitness
-- Live demo URL: pending deployment
+- Live demo URL: https://bytewitness.regal-flame-7335.chatgpt.site
 - Demo video (3–5 minutes): external recording required
-- Screenshots: generate after final browser QA
+- Screenshots: `public/screenshots/bytewitness-desktop.png` and `public/screenshots/bytewitness-mobile.png`
 - Team member details: Anand / Devpost profile

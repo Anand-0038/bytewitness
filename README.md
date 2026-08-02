@@ -2,6 +2,8 @@
 
 ByteWitness creates portable, self-signed file integrity receipts entirely in the browser. A file is hashed in chunks with SHA-256, the receipt is signed with a non-exportable ECDSA P-256 device key, and the resulting JSON proof can be verified later with no account, upload, or server.
 
+[Try ByteWitness](https://bytewitness.regal-flame-7335.chatgpt.site) · [Devpost project](https://devpost.com/software/bytewitness)
+
 ![ByteWitness seal flow](public/screenshots/bytewitness-desktop.png)
 
 ## Why it exists
