@@ -4,3 +4,10 @@ artifacts/
 design-qa.md
 .DS_Store
 *.log
+
+# Keep the public README visible; ignore other Markdown notes and drafts.
+*.md
+!README.md
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat

@@ -10,11 +10,11 @@ Digital files are effortless to edit, while ordinary users have no simple way to
 
 ## What it does
 
-ByteWitness turns any file into a portable, human-readable integrity receipt without uploading it. It hashes the file locally in 2 MB chunks, signs the receipt with a non-exportable browser key, and downloads a `.bytewitness.json` proof. Anyone can later provide the original file and proof to verify both the ECDSA signature and exact SHA-256 fingerprint. One changed byte produces a clear failure.
+ByteWitness turns any file into a portable, human-readable integrity receipt without uploading it. It hashes the file locally in 2 MB chunks, signs the receipt with a non-exportable browser key, and downloads a `.bytewitness.json` proof. Anyone can later provide the original file and proof to verify both the ECDSA signature and exact SHA-256 fingerprint. A verifier can optionally compare the receipt's key ID with an expected signer key obtained through a trusted channel. One changed byte produces a clear failure.
 
 ## How we built it
 
-The application is a static React and TypeScript web app. `@noble/hashes` performs incremental SHA-256 hashing so large files do not need to be loaded into memory at once. Web Crypto generates an ECDSA P-256 key whose private half is non-exportable; IndexedDB retains that key within the browser profile. Receipts are strict, versioned JSON validated with Zod. Verification imports only the included public key, validates the signature over canonicalized receipt fields, recalculates the file fingerprint, and compares the result. No backend or file API exists.
+The application is a static React and TypeScript web app. `@noble/hashes` performs incremental SHA-256 hashing so large files do not need to be loaded into memory at once. Web Crypto generates an ECDSA P-256 key whose private half is non-exportable; IndexedDB retains that key within the browser profile and uses add-if-absent initialization so simultaneous tabs converge on one signer key. Receipts are strict, versioned JSON validated with Zod. Verification imports only the included public key, validates the signature over canonicalized receipt fields, recalculates the file fingerprint, and optionally compares the receipt key ID with an expected signer key supplied through a trusted channel. No backend or file API exists.
 
 ## Challenges we ran into
 
@@ -26,6 +26,10 @@ The hardest product decision was being precise about what self-signed cryptograp
 - Explicit detection of both file tampering and receipt tampering.
 - No accounts, uploads, analytics, external fonts, or simulated success states.
 - A responsive, accessible interface that explains the cryptography in plain language.
+- A guided browser-local sample flow that demonstrates changed-file and tampered-receipt failures without setup friction.
+- A downloadable human-readable verification report with explicit local-time and trust-boundary wording.
+- Separate receipt-integrity, file-integrity, and optional expected-signer trust results.
+- Race-safe device-key initialization across simultaneous browser tabs.
 - A versioned proof format and regression tests for exact hashing, valid verification, changed files, and edited receipts.
 
 ## What we learned
@@ -34,7 +38,7 @@ Trustworthy product design is as much about limiting claims as adding capabiliti
 
 ## What's next for ByteWitness
 
-The next trust tier is optional external anchoring: users could publish a proof hash or device-key fingerprint to a trusted channel without exposing the original file. We also want multi-file Merkle manifests, QR-based key-ID exchange, installable offline caching, and a documented verification CLI that implements the same open proof format.
+The next optional trust tier is external anchoring: users could publish a proof hash or device-key fingerprint to a trusted channel without exposing the original file. We also want QR-based key-ID exchange, multi-file Merkle manifests, installable offline caching, and a documented verification CLI that implements the same open proof format.
 
 ## Built with
 

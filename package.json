@@ -4,13 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node api.js && vite",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build": "vite build && node scripts/prepare-sites-build.mjs",
+    "build": "node api.js && vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
     "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run build && npm run test:sites",
     "test:sites": "node --test tests/sites-worker.test.mjs"

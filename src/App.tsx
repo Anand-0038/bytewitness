@@ -1,7 +1,9 @@
 import {
   Asterisk,
+  ArrowRight,
   BracketsCurly,
   Check,
+  Copy,
   DownloadSimple,
   File,
   FileImage,
@@ -11,6 +13,7 @@ import {
   Key,
   LockKey,
   MagnifyingGlass,
+  Play,
   SealCheck,
   ShieldCheck,
   Stamp,
@@ -21,16 +24,30 @@ import {
 import { type ChangeEvent, type DragEvent, useCallback, useRef, useState } from "react";
 import {
   parseProofFile,
+  normalizeSignerKeyId,
   proofFilename,
   sealFile,
   serializeProof,
+  serializeVerificationReport,
+  verificationReportFilename,
   verifyFile,
   type ProofReceipt,
+  type SignerTrust,
   type VerificationResult,
 } from "./lib/proof";
+import { createDemoFiles, createReceiptFile, createTamperedReceiptFile } from "./lib/demo";
 
 type Mode = "seal" | "verify";
 type ProcessState = "idle" | "working" | "success" | "error";
+type KeyCopyState = "copied" | "idle" | "unavailable";
+type DemoStage =
+  | "idle"
+  | "sample-selected"
+  | "sample-sealed"
+  | "changed-ready"
+  | "changed-detected"
+  | "tampered-ready"
+  | "complete";
 
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
@@ -47,6 +64,16 @@ function shortHash(hash: string): string {
 function readableError(error: unknown): string {
   if (error instanceof Error) return error.message;
   return "Something unexpected happened. Your file was not changed or uploaded.";
+}
+
+function downloadText(filename: string, content: string, type: string): void {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 interface FilePickerProps {
@@ -106,7 +133,15 @@ function FilePicker({ id, label, hint, file, accept, onFile, compact = false }: 
       <button className="text-button" type="button" onClick={() => inputRef.current?.click()}>
         {file ? "Replace" : "Browse"}
       </button>
-      <input ref={inputRef} id={id} className="sr-only" type="file" accept={accept} onChange={handleChange} />
+      <input
+        ref={inputRef}
+        id={id}
+        className="sr-only"
+        type="file"
+        accept={accept}
+        aria-label={label}
+        onChange={handleChange}
+      />
     </fieldset>
   );
 }
@@ -125,7 +160,13 @@ function Progress({ percent, label }: { percent: number; label: string }) {
   );
 }
 
-function ProofDetails({ receipt }: { receipt: ProofReceipt }) {
+interface ProofDetailsProps {
+  copyState: KeyCopyState;
+  onCopyKey: () => void;
+  receipt: ProofReceipt;
+}
+
+function ProofDetails({ copyState, onCopyKey, receipt }: ProofDetailsProps) {
   return (
     <dl className="proof-details">
       <div>
@@ -134,10 +175,32 @@ function ProofDetails({ receipt }: { receipt: ProofReceipt }) {
       </div>
       <div>
         <dt>Signing key</dt>
-        <dd>{receipt.signer.keyId}</dd>
+        <div className="proof-details__value">
+          <dd>{receipt.signer.keyId}</dd>
+          <button
+            type="button"
+            className="text-button proof-details__copy"
+            onClick={onCopyKey}
+            aria-label="Copy signer key ID"
+          >
+            {copyState === "copied" ? (
+              <Check size={16} weight="bold" aria-hidden="true" />
+            ) : (
+              <Copy size={16} weight="bold" aria-hidden="true" />
+            )}
+            {copyState === "copied" ? "Copied" : "Copy key ID"}
+          </button>
+        </div>
+        <span className="proof-details__copy-status" aria-live="polite">
+          {copyState === "copied"
+            ? "Share this key ID through a trusted channel."
+            : copyState === "unavailable"
+              ? "Clipboard unavailable; select the key ID manually."
+              : "Use this ID when a verifier needs to confirm the expected signer."}
+        </span>
       </div>
       <div>
-        <dt>Signed on this device</dt>
+        <dt>Receipt creation time — device clock</dt>
         <dd>
           {new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(
             new Date(receipt.createdAt),
@@ -154,7 +217,7 @@ function ResultBanner({ result }: { result: VerificationResult }) {
       <div className="result result--success" role="status">
         <SealCheck size={34} weight="fill" aria-hidden="true" />
         <div>
-          <h3>Exact match. Signature valid.</h3>
+          <h3>File match confirmed. Receipt signature valid.</h3>
           <p>This file has the same SHA-256 fingerprint as the signed receipt.</p>
         </div>
       </div>
@@ -165,8 +228,11 @@ function ResultBanner({ result }: { result: VerificationResult }) {
       <div className="result result--danger" role="alert">
         <Warning size={34} weight="fill" aria-hidden="true" />
         <div>
-          <h3>File does not match.</h3>
-          <p>The receipt is authentic, but these file bytes are different from the sealed original.</p>
+          <h3>Receipt signature valid; file mismatch detected.</h3>
+          <p>
+            The receipt contents are unchanged since they were signed, but the selected file has different
+            bytes.
+          </p>
         </div>
       </div>
     );
@@ -193,6 +259,259 @@ function ResultBanner({ result }: { result: VerificationResult }) {
   );
 }
 
+interface VerificationCheckProps {
+  detail: string;
+  label: string;
+  tone: "danger" | "muted" | "success" | "warning";
+  value: string;
+}
+
+function VerificationCheck({ detail, label, tone, value }: VerificationCheckProps) {
+  return (
+    <div className={`verification-check verification-check--${tone}`}>
+      <div className="verification-check__heading">
+        <span>{label}</span>
+        <strong>{value}</strong>
+      </div>
+      <p>{detail}</p>
+    </div>
+  );
+}
+
+function signerTrustCheck(trust: SignerTrust): VerificationCheckProps {
+  switch (trust) {
+    case "expected":
+      return {
+        label: "Signer trust",
+        value: "Expected signer",
+        detail: "The receipt key ID matches the key ID you supplied.",
+        tone: "success",
+      };
+    case "different":
+      return {
+        label: "Signer trust",
+        value: "Different signer",
+        detail: "The receipt is internally valid, but its key ID does not match the expected signer.",
+        tone: "danger",
+      };
+    case "not-established":
+      return {
+        label: "Signer trust",
+        value: "Not established",
+        detail: "No independently trusted signer key ID was supplied.",
+        tone: "muted",
+      };
+  }
+}
+
+function VerificationChecks({ result }: { result: VerificationResult }) {
+  const receiptCheck: VerificationCheckProps =
+    result.status === "invalid-proof"
+      ? {
+          label: "Receipt integrity",
+          value: "Not available",
+          detail: "The receipt could not be parsed as a supported ByteWitness proof.",
+          tone: "muted",
+        }
+      : result.status === "invalid-signature"
+        ? {
+            label: "Receipt integrity",
+            value: "Invalid",
+            detail: "The signed receipt fields or signature cannot be trusted.",
+            tone: "danger",
+          }
+        : {
+            label: "Receipt integrity",
+            value: "Valid",
+            detail: "The receipt signature is valid for the public key included in that receipt.",
+            tone: "success",
+          };
+
+  const fileCheck: VerificationCheckProps =
+    result.status === "verified"
+      ? {
+          label: "File integrity",
+          value: "Match",
+          detail: "The selected file has the same SHA-256 fingerprint as the receipt.",
+          tone: "success",
+        }
+      : result.status === "file-mismatch"
+        ? {
+            label: "File integrity",
+            value: "Mismatch",
+            detail: "The selected file has different bytes from the file recorded in the receipt.",
+            tone: "danger",
+          }
+        : {
+            label: "File integrity",
+            value: "Not checked",
+            detail: "File bytes are checked only after the receipt passes signature validation.",
+            tone: "muted",
+          };
+
+  return (
+    <fieldset className="verification-checks">
+      <legend className="sr-only">Verification checks</legend>
+      <VerificationCheck {...receiptCheck} />
+      <VerificationCheck {...fileCheck} />
+      <VerificationCheck {...signerTrustCheck(result.signerTrust)} />
+    </fieldset>
+  );
+}
+
+interface ExpectedSignerFieldProps {
+  error?: string;
+  onChange: (value: string) => void;
+  value: string;
+}
+
+function ExpectedSignerField({ error, onChange, value }: ExpectedSignerFieldProps) {
+  return (
+    <div className="expected-signer">
+      <div className="expected-signer__label">
+        <label htmlFor="expected-signer-key">Expected signer key ID</label>
+        <span>Optional</span>
+      </div>
+      <p id="expected-signer-help">
+        Paste a 20-character key ID received through a channel you already trust. ByteWitness cannot establish
+        identity from the receipt alone.
+      </p>
+      <div className="expected-signer__input">
+        <input
+          id="expected-signer-key"
+          type="text"
+          value={value}
+          placeholder="e.g. 4f9a…c2d1"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          aria-describedby="expected-signer-help"
+          aria-invalid={Boolean(error)}
+          onChange={(event) => onChange(event.target.value)}
+        />
+        {value ? (
+          <button type="button" className="text-button" onClick={() => onChange("")}>
+            Clear
+          </button>
+        ) : null}
+      </div>
+      {error ? (
+        <p className="inline-error" role="alert">
+          {error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function ReceiptExplainer() {
+  return (
+    <details className="receipt-explainer">
+      <summary>
+        <BracketsCurly size={24} weight="bold" aria-hidden="true" />
+        <span>
+          <strong>What is inside this receipt?</strong>
+          <small>Read the signed fields in plain language</small>
+        </span>
+      </summary>
+      <div className="receipt-explainer__body">
+        <p>
+          Every field below is covered by the receipt signature, so changing one field breaks verification.
+        </p>
+        <dl>
+          <div>
+            <dt>File fingerprint</dt>
+            <dd>The SHA-256 digest of the exact bytes that were sealed.</dd>
+          </div>
+          <div>
+            <dt>Signer key ID</dt>
+            <dd>A short identifier for this browser’s signing key. It is continuity, not legal identity.</dd>
+          </div>
+          <div>
+            <dt>Public key</dt>
+            <dd>The non-secret key used to check that the receipt signature is valid.</dd>
+          </div>
+          <div>
+            <dt>Created at</dt>
+            <dd>
+              The clock value reported by the device when the receipt was created, not a trusted timestamp.
+            </dd>
+          </div>
+        </dl>
+      </div>
+    </details>
+  );
+}
+
+interface GuidedDemoPanelProps {
+  stage: DemoStage;
+  onContinue: () => void;
+  onRestart: () => void;
+}
+
+function GuidedDemoPanel({ stage, onContinue, onRestart }: GuidedDemoPanelProps) {
+  if (stage === "idle") return null;
+
+  const content = {
+    "sample-selected": {
+      eyebrow: "Guided demo · ready",
+      title: "Create a proof for the sample file.",
+      body: "This local sample lets you demonstrate both failure states without preparing files in advance.",
+      action: null,
+    },
+    "sample-sealed": {
+      eyebrow: "Guided demo · step 1 of 3",
+      title: "The sample is sealed. Now test changed bytes.",
+      body: "ByteWitness will switch to Verify a proof with a changed copy selected. The verification still runs for real.",
+      action: "Test changed bytes",
+    },
+    "changed-ready": {
+      eyebrow: "Guided demo · step 2 of 3",
+      title: "Verify the changed sample.",
+      body: "Click Verify integrity to show that a receipt with a valid signature cannot make different file bytes pass.",
+      action: null,
+    },
+    "changed-detected": {
+      eyebrow: "Guided demo · step 2 complete",
+      title: "Changed bytes detected. Now edit the receipt.",
+      body: "The next step restores the original sample and alters a signed receipt field so you can show signature failure too.",
+      action: "Test tampered receipt",
+    },
+    "tampered-ready": {
+      eyebrow: "Guided demo · step 3 of 3",
+      title: "Verify the edited receipt.",
+      body: "Click Verify integrity to prove that changing the timestamp or any other signed field invalidates the receipt.",
+      action: null,
+    },
+    complete: {
+      eyebrow: "Guided demo · complete",
+      title: "You showed both tampering paths.",
+      body: "The file mismatch and invalid-signature results came from the same real verification flow used for any file and receipt.",
+      action: "Run the sample again",
+    },
+  }[stage];
+
+  return (
+    <aside className="demo-guide" aria-live="polite">
+      <div className="demo-guide__copy">
+        <p>{content.eyebrow}</p>
+        <h3>{content.title}</h3>
+        <span>{content.body}</span>
+      </div>
+      {content.action ? (
+        <button
+          className="secondary-button demo-guide__action"
+          type="button"
+          onClick={stage === "complete" ? onRestart : onContinue}
+        >
+          {content.action}
+          {stage === "complete" ? <Play size={20} weight="bold" /> : <ArrowRight size={20} weight="bold" />}
+        </button>
+      ) : null}
+    </aside>
+  );
+}
+
 export function App() {
   const [mode, setMode] = useState<Mode>("seal");
   const [sealState, setSealState] = useState<ProcessState>("idle");
@@ -201,12 +520,27 @@ export function App() {
   const [selectedFile, setSelectedFile] = useState<globalThis.File>();
   const [receipt, setReceipt] = useState<ProofReceipt>();
   const [keyStorage, setKeyStorage] = useState<"persistent" | "session">();
+  const [keyCopyState, setKeyCopyState] = useState<KeyCopyState>("idle");
   const [verifyFileSelection, setVerifyFileSelection] = useState<globalThis.File>();
   const [proofFile, setProofFile] = useState<globalThis.File>();
   const [verifyState, setVerifyState] = useState<ProcessState>("idle");
   const [verifyProgress, setVerifyProgress] = useState(0);
   const [verifyError, setVerifyError] = useState<string>();
   const [verificationResult, setVerificationResult] = useState<VerificationResult>();
+  const [verificationCompletedAt, setVerificationCompletedAt] = useState<Date>();
+  const [expectedSignerKeyId, setExpectedSignerKeyId] = useState("");
+  const [expectedSignerError, setExpectedSignerError] = useState<string>();
+  const [demoOriginal, setDemoOriginal] = useState<globalThis.File>();
+  const [demoChanged, setDemoChanged] = useState<globalThis.File>();
+  const [demoStage, setDemoStage] = useState<DemoStage>("idle");
+
+  const clearVerificationResult = useCallback(() => {
+    setVerifyState("idle");
+    setVerifyProgress(0);
+    setVerifyError(undefined);
+    setVerificationResult(undefined);
+    setVerificationCompletedAt(undefined);
+  }, []);
 
   const resetSeal = useCallback(() => {
     setSealState("idle");
@@ -214,15 +548,34 @@ export function App() {
     setSealError(undefined);
     setReceipt(undefined);
     setKeyStorage(undefined);
+    setKeyCopyState("idle");
   }, []);
 
   const selectSealFile = useCallback(
     (file: globalThis.File) => {
       resetSeal();
       setSelectedFile(file);
+      setDemoOriginal(undefined);
+      setDemoChanged(undefined);
+      setDemoStage("idle");
     },
     [resetSeal],
   );
+
+  const handleLoadDemo = () => {
+    const files = createDemoFiles();
+    resetSeal();
+    clearVerificationResult();
+    setSelectedFile(files.original);
+    setVerifyFileSelection(undefined);
+    setProofFile(undefined);
+    setExpectedSignerKeyId("");
+    setExpectedSignerError(undefined);
+    setDemoOriginal(files.original);
+    setDemoChanged(files.changed);
+    setDemoStage("sample-selected");
+    setMode("seal");
+  };
 
   const handleSeal = async () => {
     if (!selectedFile || sealState === "working") return;
@@ -234,6 +587,7 @@ export function App() {
       setReceipt(result.receipt);
       setKeyStorage(result.keyStorage);
       setSealState("success");
+      setDemoStage(demoOriginal === selectedFile ? "sample-sealed" : "idle");
     } catch (error) {
       setSealError(readableError(error));
       setSealState("error");
@@ -242,26 +596,87 @@ export function App() {
 
   const handleDownload = () => {
     if (!receipt) return;
-    const blob = new Blob([serializeProof(receipt)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = proofFilename(receipt.file.name);
-    link.click();
-    URL.revokeObjectURL(url);
+    downloadText(proofFilename(receipt.file.name), serializeProof(receipt), "application/json");
+  };
+
+  const handleCopySignerKey = async () => {
+    if (!receipt || !navigator.clipboard) {
+      setKeyCopyState("unavailable");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(receipt.signer.keyId);
+      setKeyCopyState("copied");
+    } catch {
+      setKeyCopyState("unavailable");
+    }
+  };
+
+  const handleDownloadReport = () => {
+    if (!verificationResult || !verifyFileSelection) return;
+    const normalizedExpectedSignerKeyId = normalizeSignerKeyId(expectedSignerKeyId);
+    const report = serializeVerificationReport(
+      verificationResult,
+      verifyFileSelection,
+      verificationCompletedAt ?? new Date(),
+      normalizedExpectedSignerKeyId,
+    );
+    downloadText(verificationReportFilename(verifyFileSelection.name), report, "text/plain;charset=utf-8");
+  };
+
+  const prepareGuidedChangedFile = () => {
+    if (!receipt || !demoChanged) return;
+    setMode("verify");
+    setVerifyFileSelection(demoChanged);
+    setProofFile(createReceiptFile(receipt));
+    clearVerificationResult();
+    setDemoStage("changed-ready");
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".workspace")?.focus());
+  };
+
+  const prepareGuidedTamperedReceipt = () => {
+    if (!receipt || !demoOriginal) return;
+    setMode("verify");
+    setVerifyFileSelection(demoOriginal);
+    setProofFile(createTamperedReceiptFile(receipt));
+    clearVerificationResult();
+    setDemoStage("tampered-ready");
+    window.requestAnimationFrame(() => document.querySelector<HTMLElement>(".workspace")?.focus());
   };
 
   const handleVerify = async () => {
     if (!verifyFileSelection || !proofFile || verifyState === "working") return;
+    const normalizedExpectedSignerKeyId = normalizeSignerKeyId(expectedSignerKeyId);
+    if (expectedSignerKeyId.trim() && !normalizedExpectedSignerKeyId) {
+      setExpectedSignerError(
+        "Enter the 20-character hexadecimal key ID shown in a trusted receipt or profile.",
+      );
+      clearVerificationResult();
+      return;
+    }
+    setExpectedSignerError(undefined);
     setVerifyState("working");
     setVerifyError(undefined);
     setVerificationResult(undefined);
+    setVerificationCompletedAt(undefined);
     setVerifyProgress(0);
     try {
       const parsedProof = await parseProofFile(proofFile);
-      const result = await verifyFile(verifyFileSelection, parsedProof, setVerifyProgress);
+      const result = await verifyFile(verifyFileSelection, parsedProof, {
+        expectedSignerKeyId: normalizedExpectedSignerKeyId,
+        onProgress: setVerifyProgress,
+      });
       setVerificationResult(result);
+      setVerificationCompletedAt(new Date());
       setVerifyState(result.status === "verified" ? "success" : "error");
+      if (demoStage === "changed-ready" && result.status === "file-mismatch") {
+        setDemoStage("changed-detected");
+      } else if (
+        demoStage === "tampered-ready" &&
+        (result.status === "invalid-signature" || result.status === "invalid-proof")
+      ) {
+        setDemoStage("complete");
+      }
     } catch (error) {
       setVerifyError(readableError(error));
       setVerifyState("error");
@@ -374,6 +789,10 @@ export function App() {
                     <BracketsCurly size={21} />
                     Archives + more
                   </span>
+                  <button className="sample-button" type="button" onClick={handleLoadDemo}>
+                    <Play size={20} weight="bold" aria-hidden="true" />
+                    Try the guided sample
+                  </button>
                 </aside>
                 {selectedFile ? (
                   <div className="workspace__action">
@@ -392,6 +811,13 @@ export function App() {
                     ) : null}
                   </div>
                 ) : null}
+                {demoStage === "sample-selected" ? (
+                  <GuidedDemoPanel
+                    stage={demoStage}
+                    onContinue={prepareGuidedChangedFile}
+                    onRestart={handleLoadDemo}
+                  />
+                ) : null}
               </>
             ) : (
               <div className="seal-success">
@@ -402,7 +828,8 @@ export function App() {
                     <h2>{receipt.file.name}</h2>
                   </div>
                 </div>
-                <ProofDetails receipt={receipt} />
+                <ProofDetails copyState={keyCopyState} onCopyKey={handleCopySignerKey} receipt={receipt} />
+                <ReceiptExplainer />
                 <div className="seal-success__actions">
                   <button className="primary-button" type="button" onClick={handleDownload}>
                     <DownloadSimple size={24} weight="bold" />
@@ -414,6 +841,9 @@ export function App() {
                     onClick={() => {
                       setSelectedFile(undefined);
                       resetSeal();
+                      setDemoOriginal(undefined);
+                      setDemoChanged(undefined);
+                      setDemoStage("idle");
                     }}
                   >
                     Seal another file
@@ -428,10 +858,17 @@ export function App() {
                 ) : (
                   <p className="key-note">
                     <Key size={18} />
-                    Signed with this browser’s non-exportable device key. Clearing site data removes the key
-                    but not receipt verification.
+                    Signed with this browser profile’s non-exportable device key. Private browsing or clearing
+                    site data may remove the key, but not receipt verification.
                   </p>
                 )}
+                <GuidedDemoPanel
+                  stage={demoStage}
+                  onContinue={
+                    demoStage === "changed-detected" ? prepareGuidedTamperedReceipt : prepareGuidedChangedFile
+                  }
+                  onRestart={handleLoadDemo}
+                />
               </div>
             )}
           </div>
@@ -450,8 +887,8 @@ export function App() {
                 file={verifyFileSelection}
                 onFile={(file) => {
                   setVerifyFileSelection(file);
-                  setVerificationResult(undefined);
-                  setVerifyState("idle");
+                  clearVerificationResult();
+                  setDemoStage("idle");
                 }}
               />
               <FilePicker
@@ -463,11 +900,21 @@ export function App() {
                 accept="application/json,.json"
                 onFile={(file) => {
                   setProofFile(file);
-                  setVerificationResult(undefined);
-                  setVerifyState("idle");
+                  clearVerificationResult();
+                  setDemoStage("idle");
                 }}
               />
             </div>
+            <ExpectedSignerField
+              value={expectedSignerKeyId}
+              error={expectedSignerError}
+              onChange={(value) => {
+                setExpectedSignerKeyId(value);
+                setExpectedSignerError(undefined);
+                clearVerificationResult();
+                setDemoStage("idle");
+              }}
+            />
             {verifyState === "working" ? (
               <Progress percent={verifyProgress} label="Checking signature and exact bytes" />
             ) : (
@@ -486,7 +933,24 @@ export function App() {
                 {verifyError}
               </p>
             ) : null}
-            {verificationResult ? <ResultBanner result={verificationResult} /> : null}
+            {verificationResult ? (
+              <div className="verification-result">
+                <ResultBanner result={verificationResult} />
+                <VerificationChecks result={verificationResult} />
+                <button className="secondary-button" type="button" onClick={handleDownloadReport}>
+                  <DownloadSimple size={22} weight="bold" />
+                  Download verification report
+                </button>
+              </div>
+            ) : null}
+            {verificationResult ? <ReceiptExplainer /> : null}
+            <GuidedDemoPanel
+              stage={demoStage}
+              onContinue={
+                demoStage === "changed-detected" ? prepareGuidedTamperedReceipt : prepareGuidedChangedFile
+              }
+              onRestart={handleLoadDemo}
+            />
           </div>
         )}
       </section>
@@ -531,9 +995,9 @@ export function App() {
         <div>
           <h2 id="limits-title">What this proof means</h2>
           <p>
-            ByteWitness proves byte-for-byte integrity and receipt authenticity under its included public key.
-            It does not independently prove a person’s identity, legal ownership, or a trusted external
-            creation time.
+            ByteWitness proves byte-for-byte integrity and receipt signature validity under its included
+            public key. It does not independently prove a person’s identity, legal ownership, or a trusted
+            external creation time.
           </p>
         </div>
       </section>

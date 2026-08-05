@@ -52,6 +52,12 @@ export const proofReceiptSchema = z
 
 export type ProofReceipt = z.infer<typeof proofReceiptSchema>;
 export type ProgressHandler = (percent: number) => void;
+export type SignerTrust = "expected" | "different" | "not-established";
+
+export interface VerifyOptions {
+  expectedSignerKeyId?: string;
+  onProgress?: ProgressHandler;
+}
 
 export interface SealResult {
   receipt: ProofReceipt;
@@ -59,10 +65,10 @@ export interface SealResult {
 }
 
 export type VerificationResult =
-  | { status: "verified"; receipt: ProofReceipt }
-  | { status: "file-mismatch"; receipt: ProofReceipt; actualHash: string }
-  | { status: "invalid-signature"; receipt: ProofReceipt }
-  | { status: "invalid-proof"; message: string };
+  | { status: "verified"; receipt: ProofReceipt; signerTrust: SignerTrust }
+  | { status: "file-mismatch"; receipt: ProofReceipt; actualHash: string; signerTrust: SignerTrust }
+  | { status: "invalid-signature"; receipt: ProofReceipt; signerTrust: "not-established" }
+  | { status: "invalid-proof"; message: string; signerTrust: "not-established" };
 
 interface StoredKeyRecord {
   id: typeof KEY_RECORD;
@@ -166,20 +172,31 @@ async function getStoredKey(): Promise<StoredKeyRecord | undefined> {
   });
 }
 
-async function storeKey(keyPair: CryptoKeyPair): Promise<void> {
+async function storeKeyIfAbsent(keyPair: CryptoKeyPair): Promise<boolean> {
   const database = await openKeyDatabase();
   return new Promise((resolve, reject) => {
     const transaction = database.transaction(KEY_STORE, "readwrite");
-    transaction.objectStore(KEY_STORE).put({
+    const request = transaction.objectStore(KEY_STORE).add({
       id: KEY_RECORD,
       privateKey: keyPair.privateKey,
       publicKey: keyPair.publicKey,
     } satisfies StoredKeyRecord);
+    let alreadyExists = false;
+    request.onerror = (event) => {
+      if (request.error?.name === "ConstraintError") {
+        alreadyExists = true;
+        event.preventDefault();
+      }
+    };
     transaction.oncomplete = () => {
       database.close();
-      resolve();
+      resolve(!alreadyExists);
     };
     transaction.onerror = () => {
+      database.close();
+      reject(transaction.error ?? new Error("Could not save the local signing key."));
+    };
+    transaction.onabort = () => {
       database.close();
       reject(transaction.error ?? new Error("Could not save the local signing key."));
     };
@@ -192,8 +209,10 @@ async function getSigningKey(): Promise<SigningKey> {
       const stored = await getStoredKey();
       if (stored) return { ...stored, storage: "persistent" };
       const created = await createKeyPair();
-      await storeKey(created);
-      return { ...created, storage: "persistent" };
+      if (await storeKeyIfAbsent(created)) return { ...created, storage: "persistent" };
+      const winner = await getStoredKey();
+      if (winner) return { ...winner, storage: "persistent" };
+      throw new Error("Could not read the local signing key after another tab initialized it.");
     } catch {
       // Private browsing and hardened environments can disable IndexedDB.
     }
@@ -259,16 +278,43 @@ export async function parseProofFile(file: File): Promise<ProofReceipt> {
   }
 }
 
+export function normalizeSignerKeyId(value: string): string | undefined {
+  const normalized = value.trim().toLowerCase();
+  return /^[a-f0-9]{20}$/u.test(normalized) ? normalized : undefined;
+}
+
+function signerTrustFor(receipt: ProofReceipt, expectedSignerKeyId?: string): SignerTrust {
+  const expected = expectedSignerKeyId ? normalizeSignerKeyId(expectedSignerKeyId) : undefined;
+  if (!expected) return "not-established";
+  return receipt.signer.keyId === expected ? "expected" : "different";
+}
+
 export async function verifyFile(
   file: File,
   proofValue: unknown,
   onProgress?: ProgressHandler,
+): Promise<VerificationResult>;
+export async function verifyFile(
+  file: File,
+  proofValue: unknown,
+  options?: VerifyOptions,
+): Promise<VerificationResult>;
+export async function verifyFile(
+  file: File,
+  proofValue: unknown,
+  progressOrOptions?: ProgressHandler | VerifyOptions,
 ): Promise<VerificationResult> {
+  const options =
+    typeof progressOrOptions === "function" ? { onProgress: progressOrOptions } : progressOrOptions;
   let receipt: ProofReceipt;
   try {
     receipt = parseProof(proofValue);
   } catch {
-    return { status: "invalid-proof", message: "The receipt format is invalid or unsupported." };
+    return {
+      status: "invalid-proof",
+      message: "The receipt format is invalid or unsupported.",
+      signerTrust: "not-established",
+    };
   }
 
   try {
@@ -285,21 +331,130 @@ export async function verifyFile(
       base64UrlToBuffer(receipt.signature),
       receiptPayload(toPayload(receipt)),
     );
-    if (!signatureValid) return { status: "invalid-signature", receipt };
+    if (!signatureValid) return { status: "invalid-signature", receipt, signerTrust: "not-established" };
   } catch {
-    return { status: "invalid-signature", receipt };
+    return { status: "invalid-signature", receipt, signerTrust: "not-established" };
   }
 
-  const actualHash = await hashFile(file, onProgress);
-  if (actualHash !== receipt.file.sha256) return { status: "file-mismatch", receipt, actualHash };
-  return { status: "verified", receipt };
+  const signerTrust = signerTrustFor(receipt, options?.expectedSignerKeyId);
+  const actualHash = await hashFile(file, options?.onProgress);
+  if (actualHash !== receipt.file.sha256)
+    return { status: "file-mismatch", receipt, actualHash, signerTrust };
+  return { status: "verified", receipt, signerTrust };
 }
 
 export function serializeProof(receipt: ProofReceipt): string {
   return `${JSON.stringify(receipt, null, 2)}\n`;
 }
 
+function safeFilename(fileName: string): string {
+  return fileName.replace(/[^a-zA-Z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "") || "file";
+}
+
 export function proofFilename(fileName: string): string {
-  const safeName = fileName.replace(/[^a-zA-Z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "") || "file";
-  return `${safeName}.bytewitness.json`;
+  return `${safeFilename(fileName)}.bytewitness.json`;
+}
+
+export function verificationReportFilename(fileName: string): string {
+  return `${safeFilename(fileName)}.bytewitness-report.txt`;
+}
+
+function reportResult(result: VerificationResult): string {
+  switch (result.status) {
+    case "verified":
+      return "Verified — exact file match and valid receipt signature";
+    case "file-mismatch":
+      return "Failed — receipt signature valid, but file bytes differ";
+    case "invalid-signature":
+      return "Failed — receipt signature invalid";
+    case "invalid-proof":
+      return "Failed — receipt malformed or unsupported";
+  }
+}
+
+function reportSignerTrust(trust: SignerTrust): string {
+  switch (trust) {
+    case "expected":
+      return "Expected signer key matched";
+    case "different":
+      return "Different signer key";
+    case "not-established":
+      return "Not independently established";
+  }
+}
+
+function reportReceiptIntegrity(result: VerificationResult): string {
+  switch (result.status) {
+    case "invalid-proof":
+      return "Not available";
+    case "invalid-signature":
+      return "Invalid";
+    case "verified":
+    case "file-mismatch":
+      return "Valid";
+  }
+}
+
+function reportFileIntegrity(result: VerificationResult): string {
+  switch (result.status) {
+    case "verified":
+      return "Match";
+    case "file-mismatch":
+      return "Mismatch";
+    case "invalid-signature":
+    case "invalid-proof":
+      return "Not checked";
+  }
+}
+
+function formatReportDate(date: Date): string {
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "long" }).format(date);
+}
+
+export function serializeVerificationReport(
+  result: VerificationResult,
+  file: File,
+  verifiedAt = new Date(),
+  expectedSignerKeyId?: string,
+): string {
+  const lines = [
+    "ByteWitness verification report",
+    "================================",
+    "",
+    `Generated: ${formatReportDate(verifiedAt)} (local device time)`,
+    `Result: ${reportResult(result)}`,
+    `Receipt integrity: ${reportReceiptIntegrity(result)}`,
+    `File integrity: ${reportFileIntegrity(result)}`,
+    `Signer trust: ${reportSignerTrust(result.signerTrust)}`,
+    `File checked: ${file.name}`,
+    `File size: ${file.size} bytes`,
+  ];
+
+  if (result.status === "invalid-proof") {
+    lines.push(`Reason: ${result.message}`);
+  } else {
+    lines.push(
+      `Receipt file: ${result.receipt.file.name}`,
+      `Receipt created: ${formatReportDate(new Date(result.receipt.createdAt))} (device clock in receipt)`,
+      `Signer key ID: ${result.receipt.signer.keyId}`,
+      `Expected SHA-256: ${result.receipt.file.sha256}`,
+    );
+
+    if (result.status === "file-mismatch") {
+      lines.push(`Calculated SHA-256: ${result.actualHash}`);
+    }
+  }
+
+  const normalizedExpectedKeyId = expectedSignerKeyId ? normalizeSignerKeyId(expectedSignerKeyId) : undefined;
+  if (normalizedExpectedKeyId) lines.push(`Expected signer key ID: ${normalizedExpectedKeyId}`);
+
+  lines.push(
+    "",
+    "Trust boundary",
+    "--------------",
+    "ByteWitness proves byte-for-byte integrity and receipt signature validity under the public key included in the receipt.",
+    "It does not independently prove legal identity, ownership, authorship, or a trusted external creation time.",
+  );
+
+  return `${lines.join("\n")}\n`;
 }
